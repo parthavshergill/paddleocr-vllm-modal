@@ -28,6 +28,10 @@ import modal
 import time
 import subprocess
 import tempfile
+import gc
+import threading
+import traceback
+import os
 from pathlib import Path
 from collections import Counter
 
@@ -161,32 +165,43 @@ def log_region_stats(regions: list[dict], filter_types: list[str] | None = None)
 # =============================================================================
 
 def start_vllm_server(port: int = VLLM_PORT) -> subprocess.Popen:
-    """Start vLLM server with PaddleOCR-VL model optimized for OCR workloads."""
+    """Start vLLM server with PaddleOCR-VL model using official defaults."""
     cmd = [
         "python", "-m", "vllm.entrypoints.openai.api_server",
         "--model", "PaddlePaddle/PaddleOCR-VL",
         "--served-model-name", "PaddleOCR-VL-0.9B",
         "--trust-remote-code",
         "--port", str(port),
-        # === OCR-specific optimizations ===
-        "--mm-processor-cache-gb", "0",
-        # === Parallelism settings ===
-        "--max-num-seqs", "192",
-        "--max-num-batched-tokens", "32768",
-        "--max-model-len", "8192",
-        "--gpu-memory-utilization", "0.85",
-        # Note: --kv-cache-dtype fp8 requires nvcc for FlashInfer JIT compilation
-        # which isn't available in the Modal image
+        # Use vLLM defaults as recommended by official PaddleOCR docs
+        # A100 is the reference hardware for default configs
     ]
     
     print(f"[STARTUP] Starting vLLM server: {' '.join(cmd)}")
+    # IMPORTANT:
+    # - If we pipe stdout/stderr and never consume it, vLLM can eventually block
+    #   once the pipe buffer fills, causing the server to stop responding and
+    #   downstream requests to time out "randomly" after a few batches.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
     return proc
+
+
+def _stream_subprocess_output(proc: subprocess.Popen, prefix: str) -> None:
+    """Continuously drain a subprocess' stdout to avoid deadlocks from filled pipes."""
+    if proc.stdout is None:
+        return
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if not line:
+                break
+            print(f"{prefix}{line}", end="")
+    except Exception as e:
+        print(f"[WARN] Failed streaming subprocess output ({prefix.strip()}): {e}")
 
 
 def wait_for_server(base_url: str, timeout: int = 300) -> bool:
@@ -220,6 +235,8 @@ def wait_for_server(base_url: str, timeout: int = 300) -> bool:
     scaledown_window=900,  # Keep container alive 15 min after last request
     # Uncomment to always keep one container warm (costs money when idle):
     # min_containers=1,
+    # Allow only one input at a time to prevent state buildup
+    allow_concurrent_inputs=1
 )
 class PaddleOCRVLService:
     """
@@ -236,7 +253,7 @@ class PaddleOCRVLService:
         Called once when container starts.
         Starts vLLM server and initializes PaddleOCR-VL pipeline + layout model.
         """
-        from paddleocr import PaddleOCRVL, LayoutDetection
+        from paddleocr import LayoutDetection
         
         overall_start = time.perf_counter()
         
@@ -248,6 +265,13 @@ class PaddleOCRVLService:
         print("\n[1/4] Starting vLLM server...")
         vllm_start = time.perf_counter()
         self.server_proc = start_vllm_server(VLLM_PORT)
+        # Drain vLLM logs in background to prevent stdout pipe deadlock.
+        self._vllm_log_thread = threading.Thread(
+            target=_stream_subprocess_output,
+            args=(self.server_proc, "[vLLM] "),
+            daemon=True,
+        )
+        self._vllm_log_thread.start()
         
         # Wait for server to be ready
         print("[2/4] Waiting for vLLM server to be ready...")
@@ -262,15 +286,9 @@ class PaddleOCRVLService:
         
         # Initialize PaddleOCR-VL pipeline
         # Note: vl_rec_max_concurrency must be set at init time, can't be changed per-request
-        print("\n[3/4] Initializing PaddleOCR-VL pipeline (max_concurrency=96)...")
+        print("\n[3/4] Initializing PaddleOCR-VL pipeline (max_concurrency=128)...")
         pipeline_start = time.perf_counter()
-        self.pipeline = PaddleOCRVL(
-            vl_rec_backend="vllm-server",
-            vl_rec_server_url=f"{VLLM_URL}/v1",
-            vl_rec_max_concurrency=192,  # Match vLLM --max-num-seqs
-            layout_detection_model_name="PP-DocLayoutV2",
-            device="gpu:0",
-        )
+        self._init_vl_pipeline()
         pipeline_time = time.perf_counter() - pipeline_start
         print(f"[OK] Pipeline initialized (init: {pipeline_time:.1f}s)")
         
@@ -293,6 +311,84 @@ class PaddleOCRVLService:
         print("\n" + "=" * 60)
         print(f"CONTAINER READY - Total startup: {self.startup_time:.1f}s")
         print("=" * 60)
+    
+    def _init_vl_pipeline(self):
+        """Initialize or reinitialize the VL pipeline. Can be called to reset state."""
+        from paddleocr import PaddleOCRVL
+        # Increase the OpenAI(vLLM) client timeout to reduce spurious batch failures
+        # on slow pages / congested vLLM scheduling. PaddleOCR-VL passes these through
+        # to the OpenAI client via genai_config.client_kwargs.
+        try:
+            from paddlex.inference import load_pipeline_config
+
+            paddlex_config = load_pipeline_config("PaddleOCR-VL")
+            genai_cfg = (
+                paddlex_config
+                .setdefault("SubModules", {})
+                .setdefault("VLRecognition", {})
+                .setdefault("genai_config", {})
+            )
+            client_kwargs = genai_cfg.setdefault("client_kwargs", {})
+            # Defaults are often too aggressive under bursty load; make it generous.
+            client_kwargs.setdefault("timeout", float(os.environ.get("PPOCR_VLLM_TIMEOUT_S", "600")))
+            client_kwargs.setdefault("max_retries", int(os.environ.get("PPOCR_VLLM_MAX_RETRIES", "1")))
+        except Exception as e:
+            paddlex_config = None
+            print(f"[WARN] Could not load/patch PaddleX pipeline config for timeouts: {e}")
+
+        self.pipeline = PaddleOCRVL(
+            paddlex_config=paddlex_config,
+            vl_rec_backend="vllm-server",
+            vl_rec_server_url=f"{VLLM_URL}/v1",
+            vl_rec_max_concurrency=128,  # A100 has headroom for higher concurrency
+            layout_detection_model_name="PP-DocLayoutV2",
+            device="gpu:0",
+        )
+    
+    def _reset_vl_pipeline(self):
+        """Close and reinitialize the VL pipeline to clear accumulated state."""
+        try:
+            self.pipeline.close()
+        except Exception as e:
+            print(f"  [WARN] Error closing pipeline: {e}")
+        self._init_vl_pipeline()
+        print("  [OK] Pipeline reset complete")
+
+    def _ensure_vllm_healthy(self) -> bool:
+        """Quick health check + restart if needed."""
+        # Process exited?
+        if not hasattr(self, "server_proc") or self.server_proc is None:
+            return False
+        if self.server_proc.poll() is not None:
+            print(f"[WARN] vLLM process exited with code {self.server_proc.returncode}; restarting...")
+            self.server_proc = start_vllm_server(VLLM_PORT)
+            self._vllm_log_thread = threading.Thread(
+                target=_stream_subprocess_output,
+                args=(self.server_proc, "[vLLM] "),
+                daemon=True,
+            )
+            self._vllm_log_thread.start()
+            if not wait_for_server(f"{VLLM_URL}/v1", timeout=300):
+                return False
+            return True
+
+        # Server responsive?
+        if not wait_for_server(f"{VLLM_URL}/v1", timeout=10):
+            print("[WARN] vLLM health check failed; restarting...")
+            try:
+                self.server_proc.terminate()
+            except Exception:
+                pass
+            self.server_proc = start_vllm_server(VLLM_PORT)
+            self._vllm_log_thread = threading.Thread(
+                target=_stream_subprocess_output,
+                args=(self.server_proc, "[vLLM] "),
+                daemon=True,
+            )
+            self._vllm_log_thread.start()
+            return wait_for_server(f"{VLLM_URL}/v1", timeout=300)
+
+        return True
     
     @modal.exit()
     def shutdown(self):
@@ -336,6 +432,18 @@ class PaddleOCRVLService:
         
         batch_start = time.perf_counter()
         filter_types = [t.strip() for t in region_type.split(",")] if region_type else None
+
+        # vLLM can get wedged (e.g. stdout pipe fill, transient GPU issues). If that
+        # happens, downstream OpenAI-compatible calls manifest as httpx.ReadTimeout.
+        if not self._ensure_vllm_healthy():
+            return {
+                "results": [],
+                "stats": None,
+                "error": {
+                    "type": "VLLMUnhealthy",
+                    "message": "vLLM server is unhealthy/unreachable after restart attempts",
+                },
+            }
         
         print("=" * 60)
         if filter_types:
@@ -429,13 +537,60 @@ class PaddleOCRVLService:
                 # prompt_label="table" tells VL model to expect table content
                 # Note: use_queues=False is faster for decoupled approach since
                 # there's no layout→VL pipeline to overlap (we do layout separately)
+                # Force list() to consume generator immediately and avoid hanging
                 vl_start = time.perf_counter()
-                outputs = self.pipeline.predict(
-                    crop_arrays,
-                    use_layout_detection=False,  # Already cropped, skip layout
-                    use_queues=False,  # Faster for decoupled approach
-                    prompt_label="table",  # Hint to VL model for better table extraction
-                )
+                try:
+                    outputs = list(
+                        self.pipeline.predict(
+                            crop_arrays,
+                            use_layout_detection=False,  # Already cropped, skip layout
+                            use_queues=False,  # Faster for decoupled approach
+                            prompt_label="table",  # Hint to VL model for better table extraction
+                        )
+                    )
+                except Exception as e:
+                    err_tb = traceback.format_exc()
+                    print(f"[ERROR] Region-filtered VL inference failed: {type(e).__name__}: {e}\n{err_tb}")
+                    if not self._ensure_vllm_healthy():
+                        return {
+                            "results": [],
+                            "stats": None,
+                            "error": {
+                                "type": "VLLMUnhealthy",
+                                "message": "vLLM became unhealthy during request",
+                                "traceback": err_tb,
+                                "mode": "region_filtered",
+                                "num_regions": len(all_regions_info),
+                                "filter_types": filter_types,
+                            },
+                        }
+                    # Attempt one recovery: reset pipeline and retry once.
+                    self._reset_vl_pipeline()
+                    try:
+                        outputs = list(
+                            self.pipeline.predict(
+                                crop_arrays,
+                                use_layout_detection=False,
+                                use_queues=False,
+                                prompt_label="table",
+                            )
+                        )
+                    except Exception as e2:
+                        err_tb2 = traceback.format_exc()
+                        print(f"[ERROR] Region-filtered retry failed: {type(e2).__name__}: {e2}\n{err_tb2}")
+                        # Return string-only error for Modal compatibility.
+                        return {
+                            "results": [],
+                            "stats": None,
+                            "error": {
+                                "type": type(e2).__name__,
+                                "message": str(e2),
+                                "traceback": err_tb2,
+                                "mode": "region_filtered",
+                                "num_regions": len(all_regions_info),
+                                "filter_types": filter_types,
+                            },
+                        }
                 vl_time = time.perf_counter() - vl_start
                 
                 print(f"[OK] VL inference complete in {vl_time:.2f}s")
@@ -479,87 +634,82 @@ class PaddleOCRVLService:
                 return {"results": results, "stats": stats}
             
             # ============================================================
-            # DEFAULT PATH (no region filtering) - Uses decoupled approach
+            # DEFAULT PATH (no region filtering) - Uses coupled pipeline with use_queues=True
+            # This matches the official PaddleOCR-VL recommended approach
             # ============================================================
             else:
-                # Decoupled approach: layout detection first, then VL inference
-                # Same pattern as filtered path but processes all regions
-                print("\n[1/2] Running layout detection (all regions)...")
-                layout_start = time.perf_counter()
+                print("\n[COUPLED PIPELINE] Processing full images with use_queues=True...")
+                print(f"  Images: {len(temp_files)}")
                 
-                # Collect all regions across all images
-                # Store numpy arrays directly (no temp files needed!)
-                all_regions_info = []  # List of (image_name, region_idx, region_info, crop_array)
-                all_regions = []  # All detected regions (for stats logging)
+                pipeline_start = time.perf_counter()
                 
-                for temp_path in temp_files:
+                # Use the full coupled pipeline as recommended by official docs
+                # Pass temp file paths directly - pipeline handles layout + VL internally
+                try:
+                    outputs = list(
+                        self.pipeline.predict(
+                            temp_files,
+                            use_queues=True,  # Official default - enables async pipeline
+                        )
+                    )
+                except Exception as e:
+                    # Prevent Modal client-side deserialization issues (e.g. openai.* exceptions)
+                    # by returning a structured, string-only error payload.
+                    err_tb = traceback.format_exc()
+                    print(f"[ERROR] Coupled pipeline failed: {type(e).__name__}: {e}\n{err_tb}")
+                    if not self._ensure_vllm_healthy():
+                        return {
+                            "results": [],
+                            "stats": None,
+                            "error": {
+                                "type": "VLLMUnhealthy",
+                                "message": "vLLM became unhealthy during request",
+                                "traceback": err_tb,
+                                "mode": "coupled",
+                            },
+                        }
+                    # Attempt one recovery: restart pipeline (clears queues/state) and retry once.
+                    self._reset_vl_pipeline()
+                    try:
+                        outputs = list(
+                            self.pipeline.predict(
+                                temp_files,
+                                use_queues=True,
+                            )
+                        )
+                    except Exception as e2:
+                        err_tb2 = traceback.format_exc()
+                        print(f"[ERROR] Coupled pipeline retry failed: {type(e2).__name__}: {e2}\n{err_tb2}")
+                        return {
+                            "results": [],
+                            "stats": None,
+                            "error": {
+                                "type": type(e2).__name__,
+                                "message": str(e2),
+                                "traceback": err_tb2,
+                            },
+                        }
+                
+                pipeline_time = time.perf_counter() - pipeline_start
+                
+                # Collect results
+                results = []
+                total_regions = 0
+                
+                for temp_path, res in zip(temp_files, outputs):
                     name = name_to_path[temp_path]
-                    layout_output = self.layout_model.predict(temp_path)
-                    regions = extract_regions_from_layout(layout_output)
-                    all_regions.extend(regions)
-                    
-                    # Crop image to each region (no filtering)
-                    img = Image.open(io.BytesIO(name_to_bytes[name]))
-                    for idx, region in enumerate(regions):
-                        x1, y1, x2, y2 = region['coordinate']
-                        crop = img.crop((int(x1), int(y1), int(x2), int(y2)))
-                        
-                        # Convert to numpy array (BGR for OpenCV/PaddleOCR compatibility)
-                        crop_rgb = np.array(crop.convert("RGB"))
-                        crop_bgr = crop_rgb[:, :, ::-1].copy()  # RGB -> BGR
-                        
-                        all_regions_info.append((name, idx, region, crop_bgr))
-                
-                layout_time = time.perf_counter() - layout_start
-                print(f"[OK] Layout detection complete in {layout_time:.1f}s")
-                print(f"\n  Total regions detected: {len(all_regions)}")
-                log_region_stats(all_regions, filter_types=None)
-                
-                if not all_regions_info:
-                    print("\n  [WARNING] No regions detected. Nothing to process.")
-                    return {"results": [], "stats": None}
-                
-                # Pass numpy arrays directly to VL model (no temp files!)
-                print(f"\n[2/2] Processing {len(all_regions_info)} cropped regions with VL model...")
-                crop_arrays = [info[3] for info in all_regions_info]
-                
-                # VL inference on cropped regions (with use_layout_detection=False)
-                # Note: use_queues=False is faster for decoupled approach since
-                # there's no layout→VL pipeline to overlap (we do layout separately)
-                vl_start = time.perf_counter()
-                outputs = self.pipeline.predict(
-                    crop_arrays,
-                    use_layout_detection=False,  # Already cropped, skip layout
-                    use_queues=False,  # Avoid PaddleX queue deadlock
-                )
-                vl_time = time.perf_counter() - vl_start
-                
-                print(f"[OK] VL inference complete in {vl_time:.2f}s")
-                print(f"     Throughput: {len(all_regions_info) / vl_time:.2f} regions/sec")
-                
-                # Group results by original image
-                image_results = {}  # name -> list of (region_idx, region_info, md_content)
-                for (name, idx, region, _), res in zip(all_regions_info, outputs):
                     md_content = ""
+                    
                     with tempfile.TemporaryDirectory() as tmpdir:
                         res.save_to_markdown(save_path=tmpdir)
                         for md_file in Path(tmpdir).glob("*.md"):
                             md_content += md_file.read_text()
                     
-                    if name not in image_results:
-                        image_results[name] = []
-                    image_results[name].append((idx, region, md_content))
-                
-                # Reconstruct per-image results (combine regions in order)
-                results = []
-                for img_name in sorted(image_results.keys()):
-                    region_outputs = sorted(image_results[img_name], key=lambda x: x[0])
-                    combined_md = ""
-                    for idx, region, md_content in region_outputs:
-                        # Add region header
-                        combined_md += f"\n<!-- Region {idx}: {region['label']} -->\n"
-                        combined_md += md_content
-                    results.append((img_name, combined_md.strip()))
+                    results.append((name, md_content))
+                    
+                    # Count regions from result if available
+                    if hasattr(res, 'layout_parsing_result') and res.layout_parsing_result:
+                        total_regions += len(res.layout_parsing_result.get('parsing_result', []))
                 
                 # Log progress
                 for i, (img_name, _) in enumerate(results):
@@ -568,23 +718,22 @@ class PaddleOCRVLService:
                 # Timing summary
                 total_time = time.perf_counter() - batch_start
                 print("\n" + "=" * 60)
-                print("TIMING SUMMARY (Decoupled Full-Image Mode)")
+                print("TIMING SUMMARY (Coupled Pipeline Mode)")
                 print("=" * 60)
-                print(f"  Layout detection:     {layout_time:.1f}s")
-                print(f"  VL inference:         {vl_time:.1f}s")
-                print("  ─────────────────────────────")
+                print(f"  Pipeline time:        {pipeline_time:.1f}s")
                 print(f"  Total request time:   {total_time:.1f}s")
-                print(f"  VL throughput:        {len(all_regions_info) / vl_time:.2f} regions/sec")
-                print(f"  Regions processed:    {len(all_regions_info)} (no filter)")
-                print(f"  Images:               {len(images_data)}")
+                print(f"  Throughput:           {len(results) / pipeline_time:.2f} images/sec")
+                print(f"  Images processed:     {len(results)}")
+                if total_regions > 0:
+                    print(f"  Regions detected:     {total_regions}")
                 print("=" * 60)
                 
-                # Compute region stats
+                # Stats (estimated since we don't have detailed region info in coupled mode)
                 region_stats = {
-                    "num_regions": len(all_regions),
-                    "avg_width": sum(r['width'] for r in all_regions) / len(all_regions) if all_regions else 0,
-                    "avg_height": sum(r['height'] for r in all_regions) / len(all_regions) if all_regions else 0,
-                    "avg_memory_bytes": sum(r['gpu_bytes'] for r in all_regions) / len(all_regions) if all_regions else 0,
+                    "num_regions": total_regions,
+                    "avg_width": 0,
+                    "avg_height": 0,
+                    "avg_memory_bytes": 0,
                 }
                 
                 return {"results": results, "stats": region_stats}
@@ -596,6 +745,19 @@ class PaddleOCRVLService:
                     os.unlink(temp_path)
                 except Exception:
                     pass
+            
+            # Force garbage collection to help with memory
+            gc.collect()
+            # Best-effort GPU cache cleanup (available in PaddlePaddle builds with CUDA)
+            try:
+                import paddle
+
+                if hasattr(paddle, "device") and hasattr(paddle.device, "cuda"):
+                    cuda = paddle.device.cuda
+                    if hasattr(cuda, "empty_cache"):
+                        cuda.empty_cache()
+            except Exception:
+                pass
 
 
 @app.local_entrypoint()

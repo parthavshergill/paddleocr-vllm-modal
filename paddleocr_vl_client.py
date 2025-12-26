@@ -40,6 +40,7 @@ import argparse
 import modal
 import time
 from pathlib import Path
+from typing import Any
 
 
 def load_images(input_dir: str, filter_str: str, limit: int) -> list[tuple[str, bytes]]:
@@ -124,6 +125,28 @@ Examples:
         default=0,
         help="Process images in batches of this size (0 = all at once). Helps identify slow images.",
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of retries per batch on failure (default: 1).",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=5.0,
+        help="Seconds to wait between retries (multiplied by attempt number). Default: 5.0",
+    )
+    parser.add_argument(
+        "--split-on-failure",
+        action="store_true",
+        help="If a batch fails after retries, split it into halves and try again to isolate problematic pages.",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Abort the run immediately on the first batch failure.",
+    )
     
     args = parser.parse_args()
 
@@ -155,7 +178,7 @@ Examples:
         print(f"Region type:      '{args.region_type}'")
     if args.batch_size > 0:
         print(f"Batch size:       {args.batch_size}")
-    print(f"Concurrency:      192 (fixed at container startup)")
+    print("Concurrency:      128 (fixed at container startup)")
     print("=" * 60)
 
     print("\nConnecting to deployed warm service...")
@@ -183,20 +206,97 @@ Examples:
         elif b >= 1024:
             return f"{b / 1024:.2f}KB"
         return f"{b}B"
+
+    def _call_batch_with_retries(
+        batch: list[tuple[str, bytes]],
+        *,
+        batch_label: str,
+        attempt: int = 0,
+    ) -> tuple[list[tuple[str, str]], dict | None, dict | None]:
+        """
+        Returns (results, stats, error_payload).
+        - error_payload is a plain dict (stringifiable) when failures occur.
+        """
+        try:
+            response = service.process_images.remote(
+                batch,
+                region_type=args.region_type,
+            )
+        except modal.exception.ExecutionError as e:
+            # NOTE: This can include "Could not deserialize remote exception..."
+            # when the remote exception class isn't installed locally.
+            err_payload = {"type": "ExecutionError", "message": str(e)}
+            if attempt < args.retries:
+                wait_s = args.retry_backoff * (attempt + 1)
+                print(f"[ERROR] {batch_label} failed ({err_payload['type']}), retrying in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+                return _call_batch_with_retries(batch, batch_label=batch_label, attempt=attempt + 1)
+            return [], None, err_payload
+        except Exception as e:
+            err_payload = {"type": type(e).__name__, "message": str(e)}
+            if attempt < args.retries:
+                wait_s = args.retry_backoff * (attempt + 1)
+                print(f"[ERROR] {batch_label} failed ({err_payload['type']}), retrying in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+                return _call_batch_with_retries(batch, batch_label=batch_label, attempt=attempt + 1)
+            return [], None, err_payload
+
+        # Service may return structured errors instead of raising (preferred).
+        if isinstance(response, dict) and response.get("error"):
+            err_payload = response.get("error")
+            if attempt < args.retries:
+                wait_s = args.retry_backoff * (attempt + 1)
+                print(f"[ERROR] {batch_label} returned error, retrying in {wait_s:.1f}s...")
+                print(f"        {err_payload}")
+                time.sleep(wait_s)
+                return _call_batch_with_retries(batch, batch_label=batch_label, attempt=attempt + 1)
+            return response.get("results", []), response.get("stats"), err_payload
+
+        return response["results"], response.get("stats"), None
+
+    def _process_batch_maybe_split(
+        batch: list[tuple[str, bytes]],
+        *,
+        batch_label: str,
+    ) -> tuple[list[tuple[str, str]], dict | None, dict | None]:
+        results, stats, err = _call_batch_with_retries(batch, batch_label=batch_label)
+        if not err:
+            return results, stats, None
+
+        # Optionally split and retry to isolate problematic pages.
+        if args.split_on_failure and len(batch) > 1:
+            mid = len(batch) // 2
+            left, right = batch[:mid], batch[mid:]
+            print(f"[WARN] {batch_label} failed; splitting into {len(left)} + {len(right)} and retrying...")
+            left_res, left_stats, left_err = _process_batch_maybe_split(left, batch_label=f"{batch_label} (left)")
+            right_res, right_stats, right_err = _process_batch_maybe_split(right, batch_label=f"{batch_label} (right)")
+
+            combined_res = []
+            combined_res.extend(left_res)
+            combined_res.extend(right_res)
+            # Stats are not meaningfully mergeable here; return None and bubble up errors if any.
+            combined_err: dict[str, Any] | None = None
+            if left_err or right_err:
+                combined_err = {"left_error": left_err, "right_error": right_err}
+            return combined_res, None, combined_err
+
+        return results, stats, err
     
     # Batch processing mode
     if args.batch_size > 0:
         # Warmup request with first image
-        print(f"\n[WARMUP] Sending 1 image to warm up server...")
+        print("\n[WARMUP] Sending 1 image to warm up server...")
         warmup_start = time.perf_counter()
-        warmup_response = service.process_images.remote(
-            images[:1],
-            region_type=args.region_type,
-        )
+        warmup_response = service.process_images.remote(images[:1], region_type=args.region_type)
         warmup_time = time.perf_counter() - warmup_start
         warmup_results = warmup_response["results"]
         warmup_stats = warmup_response.get("stats")
+        warmup_err = warmup_response.get("error") if isinstance(warmup_response, dict) else None
         print(f"[WARMUP] Complete in {warmup_time:.2f}s")
+        if warmup_err:
+            print(f"  [WARMUP ERROR] {warmup_err}")
+            if args.fail_fast:
+                return
         if warmup_stats:
             print(f"  Regions: {warmup_stats['num_regions']}, Avg: {warmup_stats['avg_width']:.0f}x{warmup_stats['avg_height']:.0f}px, Mem: {fmt_bytes(warmup_stats['avg_memory_bytes'])}")
         all_results.extend(warmup_results)
@@ -214,14 +314,8 @@ Examples:
             print(f"  Images: {batch_names}")
             
             batch_start = time.perf_counter()
-            response = service.process_images.remote(
-                batch,
-                region_type=args.region_type,
-            )
+            results, stats, err = _process_batch_maybe_split(batch, batch_label=f"BATCH {batch_num}/{num_batches}")
             batch_time = time.perf_counter() - batch_start
-            
-            results = response["results"]
-            stats = response.get("stats")
             
             # Store batch info with stats
             batch_info = {
@@ -230,6 +324,7 @@ Examples:
                 "time": batch_time,
                 "names": batch_names,
                 "stats": stats,
+                "error": err,
             }
             batch_times.append(batch_info)
             
@@ -237,15 +332,17 @@ Examples:
             if stats:
                 stats_str = f", {stats['num_regions']} regions, avg {stats['avg_width']:.0f}x{stats['avg_height']:.0f}px, {fmt_bytes(stats['avg_memory_bytes'])}"
             
-            print(f"[BATCH {batch_num}/{num_batches}] Complete in {batch_time:.2f}s ({len(results)} items, {len(results)/batch_time:.2f} items/sec{stats_str})")
+            if err:
+                print(f"[BATCH {batch_num}/{num_batches}] FAILED in {batch_time:.2f}s (error={err})")
+                if args.fail_fast:
+                    return
+            else:
+                print(f"[BATCH {batch_num}/{num_batches}] Complete in {batch_time:.2f}s ({len(results)} items, {len(results)/batch_time:.2f} items/sec{stats_str})")
             all_results.extend(results)
     else:
         # Single request mode (original behavior)
         start = time.perf_counter()
-        response = service.process_images.remote(
-            images,
-            region_type=args.region_type,
-        )
+        response = service.process_images.remote(images, region_type=args.region_type)
         batch_time = time.perf_counter() - start
         all_results = response["results"]
         stats = response.get("stats")
@@ -255,6 +352,7 @@ Examples:
             "time": batch_time,
             "names": [n for n, _ in images],
             "stats": stats,
+            "error": response.get("error") if isinstance(response, dict) else None,
         })
 
     total_time = time.perf_counter() - overall_start
